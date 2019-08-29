@@ -12,15 +12,15 @@ test tree
 
 import unittest
 
-from sqlalchemy import Column, Boolean, Integer, create_engine
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, create_engine
 from sqlalchemy.event import contains
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, relationship
 
 from sqlalchemy_mptt import mptt_sessionmaker
 
-from . import TreeTestingMixin
 from ..mixins import BaseNestedSets
+from . import TreeTestingMixin
 
 Base = declarative_base()
 
@@ -33,6 +33,17 @@ class Tree(Base, BaseNestedSets):
 
     def __repr__(self):
         return "<Node (%s)>" % self.id
+
+
+class Leaf(Base):
+    """
+    A leaf can not be orphaned from a Tree.
+    """
+    __tablename__ = "leaf"
+
+    id = Column(Integer, primary_key=True)
+    tree_id = Column(Integer, ForeignKey('tree.id'), nullable=False)
+    tree = relationship(Tree, backref='leaves')
 
 
 class TreeWithCustomId(Base, BaseNestedSets):
@@ -209,3 +220,43 @@ class InitialInsert(unittest.TestCase):
             session,
             _tree_id
         )  # rebuild lft, rgt value automatically
+
+
+class DeletionExpiresChildrenField(unittest.TestCase):
+    """
+    Deleting a child then its parent node leads to false assumptions,
+    that the node we try to delete is available in the database.
+    """
+    def test_delete_child_then_parent_node(self):
+        engine = create_engine('sqlite:///:memory:')
+        Session = mptt_sessionmaker(sessionmaker(bind=engine))
+        session = Session()
+        Base.metadata.create_all(engine)
+
+        _tree_id = 'tree1'
+
+        for node_id, parent_id in [(1, None), (2, 1), (3, 1), (4, 2)]:
+            item = Tree(
+                id=node_id,
+                parent_id=parent_id,
+                tree_id=_tree_id
+            )
+            session.add(item)
+        session.flush()
+
+        parent = item.parent  # id: 2
+        leaf = Leaf(tree=parent)
+        session.add(leaf)
+        session.flush()
+        grand_parent = parent.parent  # id: 1
+        session.delete(item)  # id: 4
+        session.flush()
+
+        # delete the leaf to allow deletion of the Tree.
+        session.delete(leaf)
+        session.flush()
+
+        session.delete(grand_parent)  # id: 1
+        session.flush()  # Somehow this fails because
+        # we try to delete item (id:4) again. Because it is still
+        # referenced in the session by sqlalchemy.
